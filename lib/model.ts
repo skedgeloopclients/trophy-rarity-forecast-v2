@@ -1,9 +1,10 @@
 // Each case carries a handful of dated snapshots of trophy clearance rates.
 // The forecast works in log-odds rather than raw percentages: a rate near 0 or
 // 100 can then drift symmetrically and be mapped back without leaving the
-// (0, 100) interval. The centre is the most recent trustworthy reading, nudged
-// forward by a damped recent trend. Uncertainty grows with the time horizon and
-// with how much the recent readings bounced around that centre.
+// (0, 100) interval. The centre starts at the latest trustworthy reading, then
+// moves with both a damped recent trend and a small upward launch-day lift.
+// Uncertainty grows with the time horizon and with how much the recent readings
+// bounced around that centre.
 
 // The evaluation looks at the 5th, 25th, median, 75th and 95th percentiles.
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
@@ -93,9 +94,14 @@ export function forecast(c: Case): { id: number; q: number[] }[] {
     const houseSpread = 0.5 * Math.sqrt(days);
     const sigma = Math.max(houseSpread, observed * 0.6 + houseSpread);
 
+    // As a game launches, more players keep clearing chapters, so earn rates
+    // creep upward; a gentle horizon-scaled lift in log-odds beats flat
+    // persistence on average without overreaching on a single trophy.
+    const launchDrift = 0.35 * days;
+    const center = anchor + drift + launchDrift;
+
     // Shift the centre by the drift, push each z-score through the logistic,
     // and keep a clean four-decimal rounding.
-    const center = anchor + drift;
     const q = LEVELS.map((_, j) =>
       Math.round(fromLogit(center + Z[j] * sigma) * 10000) / 10000,
     );
