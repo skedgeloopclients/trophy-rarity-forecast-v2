@@ -1,16 +1,17 @@
-// Each case carries a handful of dated snapshots of trophy clearance rates.
-// The forecast works in log-odds rather than raw percentages: a rate near 0 or
-// 100 can then drift symmetrically and be mapped back without leaving the
-// (0, 100) interval. The centre starts at the latest trustworthy reading, then
-// moves with both a damped recent trend and a small upward launch-day lift.
-// Uncertainty grows with the time horizon and with how much the recent readings
-// bounced around that centre.
+// A case gives us several timestamped snapshots of how often each trophy has
+// been cleared. Raw percentages are awkward to extrapolate: they get squeezed
+// near 0 and 100. So every calculation happens in log-odds space, where upward
+// and downward pushes are symmetric, and only at the very end do we convert
+// back to a percentage. The forecast centre begins at the newest reliable
+// reading, is nudged by a tamed recent slope, and gets a small launch boost.
+// The band around it widens both with elapsed time and with recent volatility.
 
-// The evaluation looks at the 5th, 25th, median, 75th and 95th percentiles.
+// Which percentiles the harness scores: 5th, 25th, median, 75th, 95th.
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
-// Standard-normal cut points matched one-for-one with the levels above.
+// Matching standard-normal quantiles (z-scores) for those five percentiles.
 const Z = [-1.644854, -0.674490, 0, 0.674490, 1.644854];
 
+// The shape of one input case and of each history entry it contains.
 export interface Case {
   levels: number[];
   at: string;
@@ -20,98 +21,96 @@ export interface Case {
   history: Array<{ at: string; rates: Array<number | null> }>;
 }
 
-// Clamp to a hair inside [0, 100] so the log-odds transform stays finite.
-const bound = (pct: number): number => Math.min(99.99, Math.max(0.01, pct));
-// Percentage -> log-odds: the space where all the extrapolation happens.
-const toLogit = (pct: number): number => {
-  const p = bound(pct);
+// Pull a percentage just inside the open (0, 100) interval so the log-odds
+// math never divides by zero or takes the log of zero.
+const clampPct = (pct: number): number => Math.min(99.99, Math.max(0.01, pct));
+
+// Percent -> log-odds. This is the space in which we do all extrapolation.
+const logit = (pct: number): number => {
+  const p = clampPct(pct);
   return Math.log(p / (100 - p));
 };
-// Log-odds -> percentage, always landing back in the open unit interval.
-const fromLogit = (z: number): number => 100 / (1 + Math.exp(-z));
+
+// Log-odds -> percent (the logistic / expit inverse of the step above).
+const expit = (z: number): number => 100 / (1 + Math.exp(-z));
 
 /**
- * Produce five quantile estimates for every trophy in a case, valid at the
- * case's target timestamp.
+ * Return one row per trophy: its id plus five quantile estimates in percent,
+ * each valid at the case's target time.
  */
 export function forecast(c: Case): { id: number; q: number[] }[] {
-  const trophyCount = c.trophies.length;
-  // A snapshot is trustworthy only if it has a slot for every trophy.
-  const snapshots = c.history.filter((h) => h.rates && h.rates.length === trophyCount);
-  // Work in days, with a tiny floor so a near-zero horizon stays well-defined.
+  const total = c.trophies.length;
+  // Ignore malformed snapshots that do not carry a slot for every trophy.
+  const reads = c.history.filter((h) => h.rates && h.rates.length === total);
+  // Convert the horizon to days; the one-minute floor keeps the spread positive
+// even when the forecast targets a time only moments from now.
   const days = Math.max(1 / 1440, c.horizon_minutes / 1440);
 
   return c.trophies.map((trophy, idx) => {
-    // Walk newest-to-oldest to find the latest snapshot that actually has a
-    // number for this trophy; missing readings are simply skipped.
-    let latest = -1;
-    for (let k = snapshots.length - 1; k >= 0; k--) {
-      if (snapshots[k].rates[idx] !== null) {
-        latest = k;
+    // Scan backwards for the most recent snapshot with an actual number for
+    // this trophy; holes in the history are simply passed over.
+    let newest = -1;
+    for (let k = reads.length - 1; k >= 0; k--) {
+      if (reads[k].rates[idx] !== null) {
+        newest = k;
         break;
       }
     }
 
-    // Carry the last known percentage into log-odds as our anchor point.
-    const lastRate = latest >= 0 ? bound(snapshots[latest].rates[idx]!) : 0.5;
-    const anchor = toLogit(lastRate);
+    // Anchor the centre at that last known rate, defaulting to a neutral 0.5%.
+    const lastPct = newest >= 0 ? clampPct(reads[newest].rates[idx]!) : 0.5;
+    const anchor = logit(lastPct);
 
-    // Read the recent direction of travel from two snapshots back. Shrink it by
-    // half and cap its magnitude so a single noisy stretch cannot dominate.
-    let trend = 0;
-    if (latest >= 2) {
-      const endMs = Date.parse(snapshots[latest].at);
-      const startMs = Date.parse(snapshots[latest - 2].at);
+    // Estimate direction from the reading two snapshots back. Halve it and cap
+    // the daily slope so one noisy stretch cannot yank the centre too far.
+    let slope = 0;
+    if (newest >= 2) {
+      const endMs = Date.parse(reads[newest].at);
+      const startMs = Date.parse(reads[newest - 2].at);
       const spanDays = (endMs - startMs) / 86400000;
       if (spanDays > 0) {
-        const earlier = toLogit(snapshots[latest - 2].rates[idx] ?? lastRate);
-        trend = (anchor - earlier) / spanDays;
+        const earlier = logit(reads[newest - 2].rates[idx] ?? lastPct);
+        slope = (anchor - earlier) / spanDays;
       }
     }
-    const capped = Math.max(-1.5, Math.min(1.5, trend));
-    // Project the capped daily trend across the horizon, but damp it by half so
-    // the centre never chases a single volatile interval all the way.
-    const drift = capped * days * 0.5;
+    const boundedSlope = Math.max(-1.5, Math.min(1.5, slope));
+    // Project the tamed slope over the horizon, then damp it by half again.
+    const trendPush = boundedSlope * days * 0.5;
 
-    // Volatility: scatter of the last few valid log-odds readings about the
-    // anchor. A jumpy trophy earns a wider predictive band.
-    let sqSum = 0;
-    let valid = 0;
-    for (let k = Math.max(0, latest - 4); k <= latest; k++) {
-      const value = snapshots[k].rates[idx];
+    // Volatility is the spread of the last few valid log-odds around the
+    // anchor; a jumpy trophy deserves a wider predictive interval.
+    let squared = 0;
+    let seen = 0;
+    for (let k = Math.max(0, newest - 4); k <= newest; k++) {
+      const value = reads[k].rates[idx];
       if (value === null) continue;
-      const lv = toLogit(value);
-      sqSum += (lv - anchor) ** 2;
-      valid++;
+      squared += (logit(value) - anchor) ** 2;
+      seen++;
     }
-    const observed = valid > 1 ? Math.sqrt(sqSum / valid) : 0;
+    const observed = seen > 1 ? Math.sqrt(squared / seen) : 0;
 
-    // Keep the spread at least as wide as the proven house baseline (0.5 per
-    // sqrt-day), widening further only when the recent readings are jumpy.
-    // A flat history must not collapse the band: an over-confident narrow
-    // interval is heavily penalised at scoring time, whereas the baseline
-    // spread has been validated, so it is a hard lower bound — never a ceiling.
-    const houseSpread = 0.5 * Math.sqrt(days);
-    const sigma = Math.max(houseSpread, observed * 0.6 + houseSpread);
+    // The proven house baseline is 0.5 per square-root-day. Treat it as a hard
+    // floor, never a ceiling: a flat history must not produce an overconfident
+    // narrow band, which scores far worse than the validated baseline spread.
+    const baseline = 0.5 * Math.sqrt(days);
+    const sigma = Math.max(baseline, observed * 0.6 + baseline);
 
-    // As a game launches, more players keep clearing chapters, so earn rates
-    // creep upward; a gentle horizon-scaled lift in log-odds beats flat
-    // persistence on average without overreaching on a single trophy.
-    const launchDrift = 0.35 * days;
-    const center = anchor + drift + launchDrift;
+    // Trophies keep getting earned as a title settles in, so give the centre a
+    // gentle horizon-scaled upward lift instead of assuming a flat future.
+    const launchPush = 0.35 * days;
+    const center = anchor + trendPush + launchPush;
 
-    // Shift the centre by the drift, push each z-score through the logistic,
-    // and keep a clean four-decimal rounding.
+    // Place each z-score around the centre and map back to four-decimal percents.
     const q = LEVELS.map((_, j) =>
-      Math.round(fromLogit(center + Z[j] * sigma) * 10000) / 10000,
+      Math.round(expit(center + Z[j] * sigma) * 10000) / 10000,
     );
-    // Rounding can (rarely) invert neighbours; force a monotone curve and clip
-    // once more into the permitted output range.
+    // Rounding can occasionally flip a neighbouring pair, so enforce a sorted
+    // curve and then clip every value into the allowed output range.
     for (let j = 1; j < q.length; j++) {
       if (q[j] < q[j - 1]) q[j] = q[j - 1];
     }
     for (let j = 0; j < q.length; j++) {
-      q[j] = bound(q[j]);
+      q[j] = clampPct(q[j]);
     }
     return { id: trophy.id, q };
   });
