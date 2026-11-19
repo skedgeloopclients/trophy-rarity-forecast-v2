@@ -1,13 +1,13 @@
-// Rate snapshots for a case arrive as a short timeline. The simplest guess is to
-// reuse the newest percentage and widen it by a constant band. We do that, but
-// we work in log-odds (so percentages near the edges behave nicely), we lean a
-// little on the recent direction of travel, and we set the band width from how
-// erratic the observed readings were. A calm trophy gets a slim interval; a
-// choppy one gets a broad interval.
+// Each case carries a handful of dated snapshots of trophy clearance rates.
+// The forecast works in log-odds rather than raw percentages: a rate near 0 or
+// 100 can then drift symmetrically and be mapped back without leaving the
+// (0, 100) interval. The centre is the most recent trustworthy reading, nudged
+// forward by a damped recent trend. Uncertainty grows with the time horizon and
+// with how much the recent readings bounced around that centre.
 
-// The scoreboard scores the 5th, 25th, 50th, 75th and 95th percentiles.
+// The evaluation looks at the 5th, 25th, median, 75th and 95th percentiles.
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
-// How far, in standard deviations, each of those levels sits from the centre.
+// Standard-normal cut points matched one-for-one with the levels above.
 const Z = [-1.644854, -0.674490, 0, 0.674490, 1.644854];
 
 export interface Case {
@@ -19,71 +19,91 @@ export interface Case {
   history: Array<{ at: string; rates: Array<number | null> }>;
 }
 
-// Stay just inside the open interval so the log-odds transform is always finite.
-const clamp = (pct: number): number => Math.min(99.99, Math.max(0.01, pct));
-// Move from a percentage to log-odds space, where the forecasting math happens.
-const logit = (pct: number): number => {
-  const p = clamp(pct);
+// Clamp to a hair inside [0, 100] so the log-odds transform stays finite.
+const bound = (pct: number): number => Math.min(99.99, Math.max(0.01, pct));
+// Percentage -> log-odds: the space where all the extrapolation happens.
+const toLogit = (pct: number): number => {
+  const p = bound(pct);
   return Math.log(p / (100 - p));
 };
-// Bring a log-odds value back to a percentage in the range 0..100.
-const expit = (x: number): number => 100 / (1 + Math.exp(-x));
+// Log-odds -> percentage, always landing back in the open unit interval.
+const fromLogit = (z: number): number => 100 / (1 + Math.exp(-z));
 
-/** Compute five rate quantiles for each trophy at the case's target time. */
+/**
+ * Produce five quantile estimates for every trophy in a case, valid at the
+ * case's target timestamp.
+ */
 export function forecast(c: Case): { id: number; q: number[] }[] {
-  const n = c.trophies.length;
-  // A snapshot is only usable when it has one rate slot per trophy.
-  const reads = c.history.filter((h) => h.rates && h.rates.length === n);
-  // Horizon measured in days; keep a one-minute floor to avoid degenerate math.
-  const d = Math.max(1 / 1440, c.horizon_minutes / 1440);
+  const trophyCount = c.trophies.length;
+  // A snapshot is trustworthy only if it has a slot for every trophy.
+  const snapshots = c.history.filter((h) => h.rates && h.rates.length === trophyCount);
+  // Work in days, with a tiny floor so a near-zero horizon stays well-defined.
+  const days = Math.max(1 / 1440, c.horizon_minutes / 1440);
 
-  return c.trophies.map((t, i) => {
-    // Scan from newest to oldest for the last snapshot that actually carries a
-    // value for this trophy, and treat that reading as our anchor.
-    let li = -1;
-    for (let k = reads.length - 1; k >= 0; k--) {
-      if (reads[k].rates[i] !== null) { li = k; break; }
-    }
-    const lastRate = li >= 0 ? clamp(reads[li].rates[i]!) : 0.5;
-    const anchor = logit(lastRate);
-
-    // Estimate a slope in log-odds from the anchor back two usable snapshots.
-    // Cap it, take half, and stretch it across the horizon: a cautious drift.
-    let slope = 0;
-    if (li >= 2) {
-      const endT = Date.parse(reads[li].at);
-      const startT = Date.parse(reads[li - 2].at);
-      const spanDays = (endT - startT) / 86400000;
-      if (spanDays > 0) {
-        const earlier = logit(reads[li - 2].rates[i] ?? lastRate);
-        slope = (anchor - earlier) / spanDays;
+  return c.trophies.map((trophy, idx) => {
+    // Walk newest-to-oldest to find the latest snapshot that actually has a
+    // number for this trophy; missing readings are simply skipped.
+    let latest = -1;
+    for (let k = snapshots.length - 1; k >= 0; k--) {
+      if (snapshots[k].rates[idx] !== null) {
+        latest = k;
+        break;
       }
     }
-    const drift = Math.max(-1.5, Math.min(1.5, slope)) * d * 0.5;
 
-    // Volatility is the root-mean-square deviation of the last few valid logit
-    // readings around the anchor. More scatter means a wider predictive band.
-    let sumSq = 0, seen = 0;
-    for (let k = Math.max(0, li - 4); k <= li; k++) {
-      const v = reads[k].rates[i];
-      if (v === null) continue;
-      const lv = logit(v);
-      sumSq += (lv - anchor) * (lv - anchor);
-      seen++;
+    // Carry the last known percentage into log-odds as our anchor point.
+    const lastRate = latest >= 0 ? bound(snapshots[latest].rates[idx]!) : 0.5;
+    const anchor = toLogit(lastRate);
+
+    // Read the recent direction of travel from two snapshots back. Shrink it by
+    // half and cap its magnitude so a single noisy stretch cannot dominate.
+    let trend = 0;
+    if (latest >= 2) {
+      const endMs = Date.parse(snapshots[latest].at);
+      const startMs = Date.parse(snapshots[latest - 2].at);
+      const spanDays = (endMs - startMs) / 86400000;
+      if (spanDays > 0) {
+        const earlier = toLogit(snapshots[latest - 2].rates[idx] ?? lastRate);
+        trend = (anchor - earlier) / spanDays;
+      }
     }
-    const observed = seen > 1 ? Math.sqrt(sumSq / seen) : 0;
+    const capped = Math.max(-1.5, Math.min(1.5, trend));
+    const drift = capped * days * 0.5;
 
-    // Blend a minimum floor with measured movement, then cap at the house scale.
+    // Volatility: scatter of the last few valid log-odds readings about the
+    // anchor. A jumpy trophy earns a wider predictive band.
+    let sqSum = 0;
+    let valid = 0;
+    for (let k = Math.max(0, latest - 4); k <= latest; k++) {
+      const value = snapshots[k].rates[idx];
+      if (value === null) continue;
+      const lv = toLogit(value);
+      sqSum += (lv - anchor) ** 2;
+      valid++;
+    }
+    const observed = valid > 1 ? Math.sqrt(sqSum / valid) : 0;
+
+    // Floor the spread at a horizon-scaled minimum and ceiling it at the house
+    // limit, blending in the measured scatter in between.
     const sigma = Math.max(
-      0.08 * Math.sqrt(d),
-      Math.min(0.5 * Math.sqrt(d), observed * 1.2 + 0.10 * Math.sqrt(d)),
+      0.08 * Math.sqrt(days),
+      Math.min(0.5 * Math.sqrt(days), observed * 1.2 + 0.10 * Math.sqrt(days)),
     );
 
-    // Shift the centre by the drift, then push each z-score through the logistic and keep four decimals.
-    const mu = anchor + drift;
-    const q = LEVELS.map((_, j) => Math.round(expit(mu + Z[j] * sigma) * 10000) / 10000);
-    // Guard against crossings by lifting any value that fell below its neighbour.
-    for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
-    return { id: t.id, q };
+    // Shift the centre by the drift, push each z-score through the logistic,
+    // and keep a clean four-decimal rounding.
+    const center = anchor + drift;
+    const q = LEVELS.map((_, j) =>
+      Math.round(fromLogit(center + Z[j] * sigma) * 10000) / 10000,
+    );
+    // Rounding can (rarely) invert neighbours; force a monotone curve and clip
+    // once more into the permitted output range.
+    for (let j = 1; j < q.length; j++) {
+      if (q[j] < q[j - 1]) q[j] = q[j - 1];
+    }
+    for (let j = 0; j < q.length; j++) {
+      q[j] = bound(q[j]);
+    }
+    return { id: trophy.id, q };
   });
 }
