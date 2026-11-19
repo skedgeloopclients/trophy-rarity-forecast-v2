@@ -68,6 +68,8 @@ export function forecast(c: Case): { id: number; q: number[] }[] {
       }
     }
     const capped = Math.max(-1.5, Math.min(1.5, trend));
+    // Project the capped daily trend across the horizon, but damp it by half so
+    // the centre never chases a single volatile interval all the way.
     const drift = capped * days * 0.5;
 
     // Volatility: scatter of the last few valid log-odds readings about the
@@ -83,12 +85,13 @@ export function forecast(c: Case): { id: number; q: number[] }[] {
     }
     const observed = valid > 1 ? Math.sqrt(sqSum / valid) : 0;
 
-    // Floor the spread at a horizon-scaled minimum and ceiling it at the house
-    // limit, blending in the measured scatter in between.
-    const sigma = Math.max(
-      0.08 * Math.sqrt(days),
-      Math.min(0.5 * Math.sqrt(days), observed * 1.2 + 0.10 * Math.sqrt(days)),
-    );
+    // Keep the spread at least as wide as the proven house baseline (0.5 per
+    // sqrt-day), widening further only when the recent readings are jumpy.
+    // A flat history must not collapse the band: an over-confident narrow
+    // interval is heavily penalised at scoring time, whereas the baseline
+    // spread has been validated, so it is a hard lower bound — never a ceiling.
+    const houseSpread = 0.5 * Math.sqrt(days);
+    const sigma = Math.max(houseSpread, observed * 0.6 + houseSpread);
 
     // Shift the centre by the drift, push each z-score through the logistic,
     // and keep a clean four-decimal rounding.
